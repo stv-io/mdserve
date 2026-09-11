@@ -186,6 +186,15 @@
             margin-bottom: 4px;
         }
 
+        .file-list .directory {
+            margin: 14px 0 4px;
+            padding: 0 12px;
+            color: var(--blockquote-color);
+            font-size: 12px;
+            font-weight: 600;
+            overflow-wrap: anywhere;
+        }
+
         .file-list a {
             display: block;
             padding: 8px 12px;
@@ -673,9 +682,12 @@
     <div class="sidebar-content">
         <ul class="file-list">
             {% for file in files %}
+            {% if recursive_mode and file.dir and (loop.index0 == 0 or file.dir != files[loop.index0 - 1].dir) %}
+            <li class="directory">{{ file.dir|e }}</li>
+            {% endif %}
             <li>
-                <a href="/{{ file.name }}"{% if file.name == current_file %} class="active"{% endif %}>
-                    {{ file.name }}
+                <a href="{{ file.href|e }}"{% if file.name == current_file %} class="active"{% endif %}>
+                    {% if recursive_mode %}{{ file.basename|e }}{% else %}{{ file.name|e }}{% endif %}
                 </a>
             </li>
             {% endfor %}

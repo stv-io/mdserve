@@ -11,19 +11,18 @@ See the [README](README.md) for project overview and the
 ```bash
 cargo build --release
 cargo test                            # all tests
-cargo test --test integration_test    # integration tests only
+cargo test recursive                 # recursive-mode regression tests
 ```
 
-Rust 1.82+, 2021 edition. Templates are embedded at compile time via
+Rust 1.82+, 2021 edition (as declared in Cargo.toml). Templates are embedded at compile time via
 minijinja-embed (changes to `templates/` require a rebuild).
 
 ## Project structure
 
 - `src/main.rs` - CLI parsing and entry point
 - `src/app.rs` - Axum router, handlers, state management, file watcher
-- `src/lib.rs` - Markdown rendering
+- `src/app.rs` also contains Markdown rendering and inline integration tests
 - `templates/` - MiniJinja templates (Jinja2 syntax), embedded at compile time
-- `tests/integration_test.rs` - Integration tests using axum-test
 
 ## Design constraints
 
@@ -31,8 +30,11 @@ minijinja-embed (changes to `templates/` require a rebuild).
   during coding sessions. Features that push it toward a documentation platform,
   configurable server, or deployment target are out of scope.
 - **Zero config.** `mdserve file.md` must work with no flags or config files.
-- **Non-recursive.** Directory mode watches only the immediate directory, never
-  subdirectories. This is intentional.
+- **Flat by default.** Directory mode watches only the immediate directory
+  unless the user explicitly passes `--recursive`.
+- **Recursive mode.** With `--recursive`, discover and watch nested markdown
+  files without following symlinks; apply hidden, `.gitignore` and `.ignore`
+  filtering at startup and when discovering new files or directories.
 - **Pre-rendered in memory.** All tracked files are rendered to HTML on startup
   and on change. Serving is always from memory.
 - **Minimal client-side JS.** Most logic is server-side. Client JS handles

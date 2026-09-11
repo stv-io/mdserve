@@ -1,3 +1,8 @@
+## [Unreleased]
+### Features
+- Add opt-in recursive directory mode with grouped sidebar navigation, based
+  on [txsmith/mdserve](https://github.com/txsmith/mdserve/commit/fc55605782224441681c77984bd5a093036e9638)
+
 ## [1.2.0] - 2026-09-11
 ### Features
 - Set page title from filename (#74)
