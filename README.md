@@ -2,6 +2,9 @@
 
 Markdown preview server for AI coding agents.
 
+This fork is maintained at [stv-io/mdserve](https://github.com/stv-io/mdserve).
+Its releases include H1-based browser tab titles and an MP favicon.
+
 Follow along as your AI agent writes markdown, rendered live in the browser
 instead of raw text in the terminal.
 
@@ -35,16 +38,19 @@ content AI coding agents actually produce.
 
 ## Installation
 
-### macOS (Homebrew)
+### macOS and Linux binaries
 
-```bash
-brew install mdserve
-```
+Download a binary for your operating system and architecture from this fork's
+[latest GitHub release](https://github.com/stv-io/mdserve/releases/latest),
+make it executable, and place it in a directory on your `PATH`.
+
+Homebrew, Arch packages, and `cargo install mdserve` refer to the original
+upstream project; they do not install this fork's changes.
 
 ### Linux
 
 ```bash
-curl -sSfL https://raw.githubusercontent.com/jfernandez/mdserve/main/install.sh | bash
+curl -sSfL https://raw.githubusercontent.com/stv-io/mdserve/main/install.sh | bash
 ```
 
 This will automatically detect your platform and install the latest binary to your system.
@@ -54,25 +60,19 @@ This will automatically detect your platform and install the latest binary to yo
 #### Using Cargo
 
 ```bash
-cargo install mdserve
-```
-
-#### Arch Linux
-
-```bash
-sudo pacman -S mdserve
+cargo install --git https://github.com/stv-io/mdserve --tag v1.2.0 --locked
 ```
 
 #### Nix Package Manager
 
 ``` bash
-nix profile install github:jfernandez/mdserve
+nix profile install github:stv-io/mdserve
 ```
 
 #### From Source
 
 ```bash
-git clone https://github.com/jfernandez/mdserve.git
+git clone https://github.com/stv-io/mdserve.git
 cd mdserve
 cargo build --release
 cp target/release/mdserve <folder in your PATH>
@@ -80,7 +80,7 @@ cp target/release/mdserve <folder in your PATH>
 
 #### Manual Download
 
-Download the appropriate binary for your platform from the [latest release](https://github.com/jfernandez/mdserve/releases/latest).
+Download the appropriate binary for your platform from the [latest release](https://github.com/stv-io/mdserve/releases/latest).
 
 ## Claude Code Plugin
 

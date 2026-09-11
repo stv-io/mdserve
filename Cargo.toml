@@ -1,14 +1,14 @@
 [package]
 name = "mdserve"
-version = "1.1.0"
+version = "1.2.0"
 authors = ["Jose Fernandez <me@jrfernandez.com>"]
 edition = "2021"
 rust-version = "1.82.0"
 license = "MIT"
 description = "Markdown preview server for AI coding agents"
-repository = "https://github.com/jfernandez/mdserve"
-homepage = "https://github.com/jfernandez/mdserve"
-documentation = "https://github.com/jfernandez/mdserve#readme"
+repository = "https://github.com/stv-io/mdserve"
+homepage = "https://github.com/stv-io/mdserve"
+documentation = "https://github.com/stv-io/mdserve#readme"
 
 [dependencies]
 axum = { version = "0.7.9", features = ["ws"] }

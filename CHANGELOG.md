@@ -1,3 +1,21 @@
+## [1.2.0] - 2026-09-11
+### Features
+- Set page title from filename (#74)
+- Prefer first H1 for page titles
+- Add compact MP favicon
+### Bug Fixes
+- Bypass mtime check when file watcher triggers refresh (#76)
+- Update bytes and time to resolve security advisories (#79)
+### Refactoring
+- Move stray HashMap import to top-level import block (#73)
+- Deduplicate file extension extraction in image helpers (#71)
+- Remove unused WebSocket message variants (#72)
+- Remove redundant mtime check from HTTP handlers (#77)
+### Build
+- Release this fork on GitHub with Linux and macOS binaries
+- Point installation instructions and the Linux installer at this fork
+- Remove automatic crates.io publishing
+
 ## [1.1.0] - 2026-03-07
 ### Features
 - Auto-increment port when requested port is in use (#64)
@@ -90,4 +108,3 @@
 - Enable HTML tag rendering in markdown files (#2)
 
 ## [0.1.0] - 2025-09-22
-

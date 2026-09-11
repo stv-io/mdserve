@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # mdserve installer script
-# Usage: curl -sSfL https://raw.githubusercontent.com/jfernandez/mdserve/main/install.sh | bash
+# Usage: curl -sSfL https://raw.githubusercontent.com/stv-io/mdserve/main/install.sh | bash
 
 # Repository information
-REPO_OWNER="jfernandez"
+REPO_OWNER="stv-io"
 REPO_NAME="mdserve"
 BINARY_NAME="mdserve"
 
@@ -94,7 +94,7 @@ detect_platform() {
     # Normalize OS
     case "$os" in
         Linux*) os="linux" ;;
-        Darwin*) fatal "macOS is not supported by this installer. Please install using Homebrew: brew install mdserve" ;;
+        Darwin*) fatal "For macOS, download this fork's binary from https://github.com/stv-io/mdserve/releases/latest" ;;
         CYGWIN*|MINGW*|MSYS*) fatal "Windows is not currently supported" ;;
         *) fatal "Unsupported operating system: $os" ;;
     esac
@@ -109,6 +109,7 @@ detect_platform() {
     # Map to binary names used in releases
     case "$os-$arch" in
         linux-x86_64) echo "x86_64-unknown-linux-musl" ;;
+        linux-aarch64) echo "aarch64-unknown-linux-musl" ;;
         *) fatal "No binary available for $os-$arch" ;;
     esac
 }
