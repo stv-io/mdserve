@@ -25,6 +25,10 @@ struct Args {
     /// Open the preview in the default browser
     #[arg(short, long)]
     open: bool,
+
+    /// Include Markdown files in subdirectories (respects .gitignore and .ignore)
+    #[arg(long)]
+    recursive: bool,
 }
 
 #[tokio::main]
@@ -42,7 +46,11 @@ async fn main() -> Result<()> {
         (base_dir, tracked_files, false)
     } else if absolute_path.is_dir() {
         // Directory mode: scan directory for markdown files
-        let tracked_files = scan_markdown_files(&absolute_path)?;
+        let tracked_files = if args.recursive {
+            app::scan_markdown_files_recursive(&absolute_path)?
+        } else {
+            scan_markdown_files(&absolute_path)?
+        };
         if tracked_files.is_empty() {
             anyhow::bail!("No markdown files found in directory");
         }
@@ -50,6 +58,10 @@ async fn main() -> Result<()> {
     } else {
         anyhow::bail!("Path must be a file or directory");
     };
+
+    if args.recursive && !is_directory_mode {
+        anyhow::bail!("--recursive can only be used with a directory");
+    }
 
     // Single unified serve function
     serve_markdown(
@@ -59,6 +71,7 @@ async fn main() -> Result<()> {
         args.hostname,
         args.port,
         args.open,
+        args.recursive,
     )
     .await?;
 

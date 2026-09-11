@@ -35,14 +35,33 @@ mdserve ./docs/
 - Tracks all `.md` and `.markdown` files
 - Shows navigation sidebar
 
+### Recursive Directory Mode
+```bash
+mdserve ./docs/ --recursive --open
+```
+- Walks below the specified directory and tracks markdown files at any depth
+- Uses relative paths as file keys and rooted, percent-encoded URLs
+- Groups sidebar entries by relative parent directory while displaying each
+  file's basename
+- Does not follow symlinks; hidden paths and paths excluded by `.gitignore` or
+  `.ignore` are skipped at startup and when discovering new files/directories
+- Keeps the same WebSocket reload behavior and in-memory rendering cache
+
+Ignore rules also apply outside Git repositories. Changes to ignore files are
+not themselves reload triggers and do not evict tracked files; restart to fully
+apply new rules. Permanent deletions and renames retain cached entries until
+restart, preserving the existing behavior during editors' replacement saves.
+An empty directory still fails startup because there is no Markdown file to serve.
+
 ## Architecture
 
 ### State Management
 
 Central state stores:
 - Base directory path
-- HashMap of tracked files (filename → metadata + pre-rendered HTML)
+- HashMap of tracked files (relative path → metadata + pre-rendered HTML)
 - Directory mode flag (determines UI)
+- Recursive mode flag (determines discovery and sidebar grouping)
 - WebSocket broadcast channel
 
 ```mermaid
@@ -87,20 +106,27 @@ tracked_files = {
   "README.md": TrackedFile { ... }
 }
 is_directory_mode = true
+recursive_mode = false
 ```
+
+Recursive directory mode uses keys such as `api/auth.md` and
+`guides/getting-started.markdown`; each sidebar item also receives its
+relative parent (`dir`), basename, and rooted percent-encoded URL (`href`).
 
 ### Live Reload
 
-Uses [notify](https://github.com/notify-rs/notify) crate to watch base directory (non-recursive):
+Uses [notify](https://github.com/notify-rs/notify) crate to watch the base
+directory (recursively when `--recursive` is enabled):
 - Create/modify: Refresh file, add if new (directory mode only)
-- Delete: Remove from tracking
-- Rename: Remove old, add new
-- All changes trigger WebSocket reload broadcast
+- Delete/rename-away: Keep cached entry to tolerate editor replacement saves
+- Rename arrival: Refresh the tracked file or discover a new visible file
+- New/moved-in directory: Discover visible descendants in recursive mode
+- Successful updates and additions trigger WebSocket reload broadcasts
 
 File changes flow:
 1. File system event detected by `notify`
 2. Markdown re-rendered to HTML
-3. State updated (refresh/add/remove tracked file)
+3. State updated (refresh/add tracked file)
 4. `ServerMessage::Reload` broadcast via WebSocket channel
 5. All connected clients receive reload message
 6. Clients execute `window.location.reload()`
@@ -109,12 +135,14 @@ File changes flow:
 
 Single unified router handles both modes:
 - `GET /` → First file alphabetically
-- `GET /:filename.md` → Specific markdown file
-- `GET /:filename.<ext>` → Images from base directory
+- `GET /<path>.md` → Specific markdown file (including nested paths in
+  recursive mode)
+- `GET /<path>.<ext>` → Images from base directory
 - `GET /ws` → WebSocket connection
 - `GET /mermaid.min.js` → Bundled Mermaid library
 
-The `:filename` pattern rejects paths with `/`, preventing directory traversal.
+Requested paths are resolved beneath the configured base directory, preventing
+directory traversal.
 
 ### Rendering
 
@@ -131,6 +159,7 @@ Template variables:
 - `show_navigation`: Controls sidebar visibility
 - `files`: List of tracked files (directory mode)
 - `current_file`: Active file name (directory mode)
+- `recursive_mode`: Whether the sidebar uses directory grouping
 
 ## Design Decisions
 
@@ -138,12 +167,15 @@ Template variables:
 
 **Pre-rendered caching**: All tracked files rendered to HTML in memory on startup and file change. Serving always from memory, never from disk.
 
-**Non-recursive watching**: Only immediate directory, no subdirectories. Simplifies security and state management.
+**Opt-in recursion**: Flat directory mode stays simple and compatible by
+default; `--recursive` adds nested discovery and watching only when requested.
+Recursive traversal does not follow directory symlinks and keeps all rendered
+files in memory.
 
 **Server-side logic**: Most logic lives server-side (markdown rendering, file tracking, navigation, active file highlighting, live reload triggering). Client-side JavaScript minimal (theme management, reload execution).
 
 ## Constraints
 
-- Non-recursive (flat directories only)
+- Flat by default; recursive traversal is opt-in
 - Alphabetical file ordering only
 - All files pre-rendered in memory

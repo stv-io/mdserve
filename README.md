@@ -121,6 +121,12 @@ mdserve README.md
 # Serve all markdown files in a directory
 mdserve docs/
 
+# Serve markdown files in nested directories
+mdserve docs/ --recursive
+
+# Serve nested documentation and open it automatically
+mdserve docs/ --recursive --open
+
 # Serve on custom port
 mdserve README.md --port 8080
 mdserve docs/ -p 8080
@@ -142,6 +148,23 @@ mdserve README.md --open
 - Watches for new markdown files added to the directory
 - Only monitors the immediate directory (non-recursive)
 
+Add `--recursive` to include markdown files below the directory at any depth.
+The sidebar groups files by relative directory, and links preserve their full
+relative paths. Recursive discovery skips hidden files and directories,
+paths excluded by `.gitignore` or `.ignore`, and symbolic links. These rules
+apply at startup and when discovering new files or moved-in folders, including
+outside Git repositories. Ignore-file edits do not automatically remove
+already tracked files; restart the server to apply changed rules to all files.
+A directory with no visible markdown files still produces the startup error.
+
+All discovered documents are rendered into memory, so use a focused docs
+directory for large repositories. As in flat mode, permanent deletions and
+renames can leave cached sidebar entries until restart; this preserves live
+preview during editors' temporary rename-and-replace saves.
+
+Without `--recursive`, directory mode remains flat and scans only the
+immediate directory.
+
 
 ## Themes
 
@@ -158,7 +181,7 @@ For detailed information about mdserve's internal architecture, design decisions
 
 ### Prerequisites
 
-- Rust 1.85+ (2024 edition)
+- Rust toolchain compatible with the locked dependencies (2021 edition)
 
 ### Building
 
@@ -172,8 +195,8 @@ cargo build --release
 # Run all tests
 cargo test
 
-# Run integration tests only
-cargo test --test integration_test
+# Run recursive-mode regression tests (tests live inline in src/app.rs)
+cargo test recursive
 ```
 
 ## Contributing

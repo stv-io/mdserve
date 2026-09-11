@@ -10,6 +10,7 @@ use axum::{
     Router,
 };
 use futures_util::{SinkExt, StreamExt};
+use ignore::WalkBuilder;
 use markdown::mdast::Node;
 use minijinja::{context, value::Value, Environment};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -67,6 +68,76 @@ pub(crate) fn scan_markdown_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(md_files)
 }
 
+/// Recursively scan a directory using the same ignore rules that developers
+/// expect from source trees. Symlinked directories are never followed.
+pub(crate) fn scan_markdown_files_recursive(dir: &Path) -> Result<Vec<PathBuf>> {
+    let root = dir.canonicalize()?;
+    let mut files = Vec::new();
+    for entry in markdown_walker(&root).build() {
+        let entry = entry?;
+        if entry.file_type().is_some_and(|kind| kind.is_file()) && is_markdown_file(entry.path()) {
+            files.push(entry.into_path());
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn markdown_walker(root: &Path) -> WalkBuilder {
+    let mut walker = WalkBuilder::new(root);
+    walker.require_git(false).follow_links(false);
+    walker
+}
+
+/// Start at the root so ancestor ignore rules also apply to new subtrees.
+fn visible_markdown_files_under(root: &Path, subtree: &Path) -> Vec<PathBuf> {
+    let subtree = subtree.to_path_buf();
+    let filter = subtree.clone();
+    markdown_walker(root)
+        .filter_entry(move |entry| {
+            filter.starts_with(entry.path()) || entry.path().starts_with(&filter)
+        })
+        .build()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.path().starts_with(&subtree)
+                && entry.file_type().is_some_and(|kind| kind.is_file())
+                && is_markdown_file(entry.path())
+        })
+        .map(|entry| entry.into_path())
+        .collect()
+}
+
+fn relative_key(base_dir: &Path, path: &Path) -> Result<String> {
+    let relative = path
+        .strip_prefix(base_dir)
+        .context("path is outside server root")?;
+    let parts = relative
+        .components()
+        .map(|part| {
+            let std::path::Component::Normal(name) = part else {
+                anyhow::bail!("path is not a normal relative path");
+            };
+            name.to_str().context("path is not valid UTF-8")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(parts.join("/"))
+}
+
+fn encoded_url(key: &str) -> String {
+    use std::fmt::Write;
+    let mut url = String::from("/");
+    for byte in key.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                url.push(byte as char)
+            }
+            _ => write!(url, "%{byte:02X}").expect("writing to a string cannot fail"),
+        }
+    }
+    url
+}
+
 fn is_markdown_file(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -85,21 +156,27 @@ struct MarkdownState {
     base_dir: PathBuf,
     tracked_files: HashMap<String, TrackedFile>,
     is_directory_mode: bool,
+    recursive_mode: bool,
     change_tx: broadcast::Sender<ServerMessage>,
 }
 
 impl MarkdownState {
-    fn new(base_dir: PathBuf, file_paths: Vec<PathBuf>, is_directory_mode: bool) -> Result<Self> {
+    fn new(
+        base_dir: PathBuf,
+        file_paths: Vec<PathBuf>,
+        is_directory_mode: bool,
+        recursive_mode: bool,
+    ) -> Result<Self> {
         let (change_tx, _) = broadcast::channel::<ServerMessage>(16);
 
         let mut tracked_files = HashMap::new();
         for file_path in file_paths {
+            let filename = file_key(&base_dir, &file_path, recursive_mode)?;
             let metadata = fs::metadata(&file_path)?;
             let last_modified = metadata.modified()?;
             let content = fs::read_to_string(&file_path)?;
             let html = Self::markdown_to_html(&content)?;
 
-            let filename = file_path.file_name().unwrap().to_string_lossy().to_string();
             let page_title = page_title(&content, &filename);
 
             tracked_files.insert(
@@ -117,6 +194,7 @@ impl MarkdownState {
             base_dir,
             tracked_files,
             is_directory_mode,
+            recursive_mode,
             change_tx,
         })
     }
@@ -133,6 +211,7 @@ impl MarkdownState {
 
     fn refresh_file(&mut self, filename: &str) -> Result<()> {
         if let Some(tracked) = self.tracked_files.get_mut(filename) {
+            file_key(&self.base_dir, &tracked.path, self.recursive_mode)?;
             let content = fs::read_to_string(&tracked.path)?;
             tracked.html = Self::markdown_to_html(&content)?;
             tracked.page_title = page_title(&content, filename);
@@ -142,7 +221,7 @@ impl MarkdownState {
     }
 
     fn add_tracked_file(&mut self, file_path: PathBuf) -> Result<()> {
-        let filename = file_path.file_name().unwrap().to_string_lossy().to_string();
+        let filename = file_key(&self.base_dir, &file_path, self.recursive_mode)?;
 
         if self.tracked_files.contains_key(&filename) {
             return Ok(());
@@ -174,6 +253,20 @@ impl MarkdownState {
             .unwrap_or_else(|_| "Error parsing markdown".to_string());
 
         Ok(html_body)
+    }
+}
+
+fn file_key(base_dir: &Path, path: &Path, recursive_mode: bool) -> Result<String> {
+    if !path.canonicalize()?.starts_with(base_dir) {
+        anyhow::bail!("file is outside server root");
+    }
+    if recursive_mode {
+        relative_key(base_dir, path)
+    } else {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+            .context("file name is not valid UTF-8")
     }
 }
 
@@ -234,16 +327,35 @@ fn filename_stem(filename: &str) -> &str {
 /// Handles a markdown file that may have been created or modified.
 /// Refreshes tracked files or adds new files in directory mode, sending reload notifications.
 async fn handle_markdown_file_change(path: &Path, state: &SharedMarkdownState) {
+    let mut state_guard = state.lock().await;
+    if path.is_dir() {
+        if state_guard.recursive_mode {
+            let mut changed = false;
+            for file in visible_markdown_files_under(&state_guard.base_dir, path) {
+                let Ok(key) = file_key(&state_guard.base_dir, &file, true) else {
+                    continue;
+                };
+                let result = if state_guard.tracked_files.contains_key(&key) {
+                    state_guard.refresh_file(&key)
+                } else {
+                    state_guard.add_tracked_file(file)
+                };
+                changed |= result.is_ok();
+            }
+            if changed {
+                let _ = state_guard.change_tx.send(ServerMessage::Reload);
+            }
+        }
+        return;
+    }
     if !is_markdown_file(path) {
         return;
     }
 
-    let filename = path.file_name().and_then(|n| n.to_str()).map(String::from);
-    let Some(filename) = filename else {
-        return;
+    let filename = match file_key(&state_guard.base_dir, path, state_guard.recursive_mode) {
+        Ok(filename) => filename,
+        Err(_) => return,
     };
-
-    let mut state_guard = state.lock().await;
 
     // If file is already tracked, refresh its content
     if state_guard.tracked_files.contains_key(&filename) {
@@ -251,6 +363,14 @@ async fn handle_markdown_file_change(path: &Path, state: &SharedMarkdownState) {
             let _ = state_guard.change_tx.send(ServerMessage::Reload);
         }
     } else if state_guard.is_directory_mode {
+        if state_guard.recursive_mode
+            && visible_markdown_files_under(&state_guard.base_dir, path).is_empty()
+        {
+            return;
+        }
+        if !state_guard.recursive_mode && path.parent() != Some(state_guard.base_dir.as_path()) {
+            return;
+        }
         // New file in directory mode - add and reload
         if state_guard.add_tracked_file(path.to_path_buf()).is_ok() {
             let _ = state_guard.change_tx.send(ServerMessage::Reload);
@@ -293,7 +413,7 @@ async fn handle_file_event(event: Event, state: &SharedMarkdownState) {
         }
         _ => {
             for path in &event.paths {
-                if is_markdown_file(path) {
+                if path.is_dir() || is_markdown_file(path) {
                     match event.kind {
                         notify::EventKind::Create(_)
                         | notify::EventKind::Modify(notify::event::ModifyKind::Data(_)) => {
@@ -323,10 +443,20 @@ async fn handle_file_event(event: Event, state: &SharedMarkdownState) {
     }
 }
 
+#[cfg(test)]
 fn new_router(
     base_dir: PathBuf,
     tracked_files: Vec<PathBuf>,
     is_directory_mode: bool,
+) -> Result<Router> {
+    new_router_with_options(base_dir, tracked_files, is_directory_mode, false)
+}
+
+fn new_router_with_options(
+    base_dir: PathBuf,
+    tracked_files: Vec<PathBuf>,
+    is_directory_mode: bool,
+    recursive_mode: bool,
 ) -> Result<Router> {
     let base_dir = base_dir.canonicalize()?;
 
@@ -334,6 +464,7 @@ fn new_router(
         base_dir.clone(),
         tracked_files,
         is_directory_mode,
+        recursive_mode,
     )?));
 
     let watcher_state = state.clone();
@@ -348,7 +479,14 @@ fn new_router(
         Config::default(),
     )?;
 
-    watcher.watch(&base_dir, RecursiveMode::NonRecursive)?;
+    watcher.watch(
+        &base_dir,
+        if recursive_mode {
+            RecursiveMode::Recursive
+        } else {
+            RecursiveMode::NonRecursive
+        },
+    )?;
 
     tokio::spawn(async move {
         let _watcher = watcher;
@@ -398,11 +536,17 @@ pub(crate) async fn serve_markdown(
     hostname: impl AsRef<str>,
     port: u16,
     open: bool,
+    recursive_mode: bool,
 ) -> Result<()> {
     let hostname = hostname.as_ref();
 
     let first_file = tracked_files.first().cloned();
-    let router = new_router(base_dir.clone(), tracked_files, is_directory_mode)?;
+    let router = new_router_with_options(
+        base_dir.clone(),
+        tracked_files,
+        is_directory_mode,
+        recursive_mode,
+    )?;
 
     let (listener, actual_port) = bind_with_retry(hostname, port).await?;
 
@@ -515,7 +659,7 @@ async fn serve_file(
     AxumPath(filename): AxumPath<String>,
     State(state): State<SharedMarkdownState>,
 ) -> axum::response::Response {
-    if filename.ends_with(".md") || filename.ends_with(".markdown") {
+    if is_markdown_file(Path::new(&filename)) {
         let state = state.lock().await;
 
         if !state.tracked_files.contains_key(&filename) {
@@ -557,13 +701,42 @@ async fn render_markdown(state: &MarkdownState, current_file: &str) -> (StatusCo
         };
 
     let rendered = if state.show_navigation() {
-        let filenames = state.get_sorted_filenames();
+        let mut filenames = state.get_sorted_filenames();
+        // Sidebar grouping is independent of the alphabetical landing page.
+        if state.recursive_mode {
+            filenames.sort_by(|a, b| {
+                Path::new(a)
+                    .parent()
+                    .cmp(&Path::new(b).parent())
+                    .then_with(|| a.cmp(b))
+            });
+        }
         let files: Vec<Value> = filenames
             .iter()
             .map(|name| {
                 Value::from_object({
                     let mut map = std::collections::HashMap::new();
                     map.insert("name".to_string(), Value::from(name.clone()));
+                    // The encoder emits only URL-safe ASCII, '%' and '/'.
+                    map.insert(
+                        "href".to_string(),
+                        Value::from_safe_string(encoded_url(name)),
+                    );
+                    let path = Path::new(name);
+                    let dir = path
+                        .parent()
+                        .and_then(|parent| parent.to_str())
+                        .filter(|dir| !dir.is_empty())
+                        .unwrap_or("");
+                    map.insert("dir".to_string(), Value::from(dir));
+                    map.insert(
+                        "basename".to_string(),
+                        Value::from(
+                            path.file_name()
+                                .and_then(|part| part.to_str())
+                                .unwrap_or(name),
+                        ),
+                    );
                     map
                 })
             })
@@ -573,6 +746,7 @@ async fn render_markdown(state: &MarkdownState, current_file: &str) -> (StatusCo
             content => content,
             mermaid_enabled => has_mermaid,
             show_navigation => true,
+            recursive_mode => state.recursive_mode,
             files => files,
             current_file => current_file,
             page_title => page_title,
@@ -590,6 +764,7 @@ async fn render_markdown(state: &MarkdownState, current_file: &str) -> (StatusCo
             content => content,
             mermaid_enabled => has_mermaid,
             show_navigation => false,
+            recursive_mode => false,
             page_title => page_title,
         }) {
             Ok(r) => r,
@@ -751,6 +926,296 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    fn recursive_fixture() -> (TempDir, PathBuf) {
+        let temp = tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for dir in ["a", "a/deep", "b", "ignored", ".hidden"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        for (path, text) in [
+            ("z.md", "# Root"),
+            (
+                "a/README.md",
+                "# Design\n\n[Operations](../b/README.md)\n\n![Diagram](diagram.svg)",
+            ),
+            ("a/deep/guide.markdown", "# Deep"),
+            ("b/README.md", "# Operations"),
+            ("a/Plan # 1%?.MD", "# Encoded"),
+            (
+                "a/diagram.svg",
+                "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>",
+            ),
+            ("a/.ignore", "private.md\n"),
+            ("a/private.md", "# Private"),
+            (".gitignore", "ignored/\n"),
+            ("ignored/secret.md", "# Secret"),
+            (".hidden/secret.md", "# Hidden"),
+        ] {
+            fs::write(root.join(path), text).unwrap();
+        }
+        (temp, root)
+    }
+
+    fn recursive_router(root: &Path) -> Router {
+        new_router_with_options(
+            root.to_path_buf(),
+            scan_markdown_files_recursive(root).unwrap(),
+            true,
+            true,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_recursive_scan_applies_ignore_rules_outside_git() {
+        let (_temp, root) = recursive_fixture();
+        let keys: Vec<_> = scan_markdown_files_recursive(&root)
+            .unwrap()
+            .iter()
+            .map(|path| relative_key(&root, path).unwrap())
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "a/Plan # 1%?.MD",
+                "a/README.md",
+                "a/deep/guide.markdown",
+                "b/README.md",
+                "z.md"
+            ]
+        );
+        assert_eq!(scan_markdown_files(&root).unwrap(), [root.join("z.md")]);
+    }
+
+    #[tokio::test]
+    async fn test_recursive_routes_titles_groups_and_encoded_links() {
+        let (_temp, root) = recursive_fixture();
+        let server = TestServer::new(recursive_router(&root)).unwrap();
+        let design = server.get("/a/README.md").await;
+        design.assert_status_ok();
+        let body = design.text();
+        assert!(body.contains("<title>Design</title>"));
+        assert!(body.contains(r#"href="/a/README.md" class="active""#));
+        assert!(body.contains(r#"href="/a/Plan%20%23%201%25%3F.MD""#));
+        assert!(body.contains(r#"href="../b/README.md""#));
+        assert!(body.contains(r#"src="diagram.svg""#));
+        assert!(body.contains("%3EMP%3C/text%3E"));
+        assert_eq!(body.matches(r#"class="directory">a</li>"#).count(), 1);
+        assert!(
+            body.find(r#"href="/z.md""#).unwrap()
+                < body.find(r#"class="directory">a</li>"#).unwrap()
+        );
+        assert!(!body.contains("private.md"));
+        assert!(!body.contains("secret.md"));
+
+        assert!(server
+            .get("/b/README.md")
+            .await
+            .text()
+            .contains("<title>Operations</title>"));
+        assert!(server
+            .get("/a/Plan%20%23%201%25%3F.MD")
+            .await
+            .text()
+            .contains("<title>Encoded</title>"));
+        server
+            .get("/a/deep/guide.markdown")
+            .await
+            .assert_status_ok();
+        server.get("/a/diagram.svg").await.assert_status_ok();
+        server.get("/a/private.md").await.assert_status_not_found();
+        server
+            .get("/ignored/secret.md")
+            .await
+            .assert_status_not_found();
+        // Landing page remains alphabetical by full key, independent of grouping.
+        assert!(server
+            .get("/")
+            .await
+            .text()
+            .contains("<title>Encoded</title>"));
+
+        let flat = TestServer::new(
+            new_router(root.clone(), scan_markdown_files(&root).unwrap(), true).unwrap(),
+        )
+        .unwrap();
+        flat.get("/a/README.md").await.assert_status_not_found();
+        assert!(!flat.get("/").await.text().contains(r#"class="directory""#));
+    }
+
+    #[tokio::test]
+    async fn test_recursive_directory_events_discover_only_visible_files() {
+        let (_temp, root) = recursive_fixture();
+        let state = Arc::new(Mutex::new(
+            MarkdownState::new(
+                root.clone(),
+                scan_markdown_files_recursive(&root).unwrap(),
+                true,
+                true,
+            )
+            .unwrap(),
+        ));
+        let mut reloads = state.lock().await.change_tx.subscribe();
+        fs::create_dir_all(root.join("new/sub")).unwrap();
+        fs::write(root.join("new/.ignore"), "secret.md\n").unwrap();
+        fs::write(root.join("new/secret.md"), "# Secret").unwrap();
+        fs::write(root.join("new/sub/README.md"), "# New").unwrap();
+        // A moved-in directory may arrive without any per-file events.
+        let event = Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Name(
+            notify::event::RenameMode::Both,
+        )))
+        .add_path(root.join("previous"))
+        .add_path(root.join("new"));
+        handle_file_event(event, &state).await;
+        assert_eq!(reloads.try_recv().unwrap(), ServerMessage::Reload);
+        assert!(state
+            .lock()
+            .await
+            .tracked_files
+            .contains_key("new/sub/README.md"));
+        assert!(!state
+            .lock()
+            .await
+            .tracked_files
+            .contains_key("new/secret.md"));
+
+        fs::write(root.join("ignored/later.md"), "# Still ignored").unwrap();
+        let event = Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+            .add_path(root.join("ignored/later.md"));
+        handle_file_event(event, &state).await;
+        assert!(!state
+            .lock()
+            .await
+            .tracked_files
+            .contains_key("ignored/later.md"));
+        assert!(reloads.try_recv().is_err());
+
+        fs::create_dir_all(root.join("created")).unwrap();
+        fs::write(root.join("created/notes.md"), "# Created").unwrap();
+        handle_file_event(
+            Event::new(notify::EventKind::Create(notify::event::CreateKind::Folder))
+                .add_path(root.join("created")),
+            &state,
+        )
+        .await;
+        assert!(state
+            .lock()
+            .await
+            .tracked_files
+            .contains_key("created/notes.md"));
+    }
+
+    #[tokio::test]
+    async fn test_recursive_watch_updates_nested_editor_replacement() {
+        let (_temp, root) = recursive_fixture();
+        let server = TestServer::builder()
+            .http_transport()
+            .build(recursive_router(&root))
+            .unwrap();
+        let mut ws = server.get_websocket("/ws").await.into_websocket().await;
+        tokio::time::sleep(Duration::from_millis(FILE_WATCH_DELAY_MS)).await;
+        fs::write(root.join("a/replacement.tmp"), "# Updated design").unwrap();
+        fs::rename(root.join("a/replacement.tmp"), root.join("a/README.md")).unwrap();
+        tokio::time::timeout(Duration::from_secs(WEBSOCKET_TIMEOUT_SECS), async {
+            loop {
+                assert_eq!(
+                    ws.receive_json::<ServerMessage>().await,
+                    ServerMessage::Reload
+                );
+                if server
+                    .get("/a/README.md")
+                    .await
+                    .text()
+                    .contains("<title>Updated design</title>")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("nested editor replacement should refresh and reload");
+        assert!(server
+            .get("/b/README.md")
+            .await
+            .text()
+            .contains("<title>Operations</title>"));
+
+        fs::create_dir_all(root.join("fresh/nested")).unwrap();
+        fs::write(root.join("fresh/nested/new.md"), "# Newly discovered").unwrap();
+        tokio::time::timeout(Duration::from_secs(WEBSOCKET_TIMEOUT_SECS), async {
+            loop {
+                assert_eq!(
+                    ws.receive_json::<ServerMessage>().await,
+                    ServerMessage::Reload
+                );
+                if server.get("/fresh/nested/new.md").await.status_code() == StatusCode::OK {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("a new nested directory should be discovered by the watcher");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_recursive_symlinks_and_path_escapes_do_not_expose_files() {
+        use std::os::unix::fs::symlink;
+        use tower::ServiceExt;
+        let (_temp, root) = recursive_fixture();
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("secret.md"), "# Outside secret").unwrap();
+        fs::write(outside.path().join("secret.svg"), "outside image").unwrap();
+        symlink(outside.path(), root.join("escape")).unwrap();
+        symlink(outside.path().join("secret.md"), root.join("leak.md")).unwrap();
+        symlink(&root, root.join("cycle")).unwrap();
+        let router = recursive_router(&root);
+        let server = TestServer::new(router.clone()).unwrap();
+        server.get("/leak.md").await.assert_status_not_found();
+        server
+            .get("/escape/secret.md")
+            .await
+            .assert_status_not_found();
+        assert_eq!(
+            server.get("/escape/secret.svg").await.status_code(),
+            StatusCode::FORBIDDEN
+        );
+        let request = axum::http::Request::builder()
+            .uri("/../outside.svg")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_ne!(
+            router.oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        // A tracked file replaced by an outside-root symlink must not be read.
+        let mut state = MarkdownState::new(
+            root.clone(),
+            scan_markdown_files_recursive(&root).unwrap(),
+            true,
+            true,
+        )
+        .unwrap();
+        fs::remove_file(root.join("a/README.md")).unwrap();
+        symlink(outside.path().join("secret.md"), root.join("a/README.md")).unwrap();
+        assert!(state.refresh_file("a/README.md").is_err());
+        assert_eq!(state.tracked_files["a/README.md"].page_title, "Design");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_recursive_unicode_and_literal_backslash_filenames() {
+        let (_temp, root) = recursive_fixture();
+        fs::write(root.join("a/café\\notes.md"), "# Special name").unwrap();
+        let server = TestServer::new(recursive_router(&root)).unwrap();
+        assert!(server
+            .get("/a/caf%C3%A9%5Cnotes.md")
+            .await
+            .text()
+            .contains("<title>Special name</title>"));
+    }
 
     #[test]
     fn test_is_markdown_file() {
